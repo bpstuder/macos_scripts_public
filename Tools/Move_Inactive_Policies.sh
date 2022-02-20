@@ -1,6 +1,6 @@
 #!/bin/sh
 ###
-# File: Move_Inactive_Policies.sh
+# File: Move_Inactive_policies.sh
 # File Created: 2021-07-27 10:47:10
 # Usage : Move the non active policies into a specific category
 # Author: Benoit-Pierre Studer
@@ -8,65 +8,91 @@
 # HISTORY:
 ###
 
-URL_JAMF=""
+jamfProURL=$(/usr/bin/defaults read /Library/Preferences/com.jamfsoftware.jamf jss_url)
 #### Decrypt variable ####
 
-SALT_STRING="" 
-CRYPT_STRING=""
-PASS_PHRASE_STRING="" # Passphrase for decrypt
-DECRYPT_STRING=$(echo "${CRYPT_STRING}" | /usr/bin/openssl enc -aes256 -d -a -A -S "${SALT_STRING}" -k "${PASS_PHRASE_STRING}")
+# SALT_STRING="" 
+# CRYPT_STRING=""
+# PASS_PHRASE_STRING="" # Passphrase for decrypt
+# DECRYPT_STRING=$(echo "${CRYPT_STRING}" | /usr/bin/openssl enc -aes256 -d -a -A -S "${SALT_STRING}" -k "${PASS_PHRASE_STRING}")
 
-TARGET_CATEGORY_ID="42" #Jamf
-TARGET_CATEGORY_NAME="Z_Archives" #Jamf
+read -p 'Username: ' username
+read -sp 'Password: ' password
+# created base64-encoded credentials
+encodedCredentials=$( printf "$username:$password" | /usr/bin/iconv -t ISO-8859-1 | /usr/bin/base64 -i - )
 
-PAYLOAD="<?xml version='1.0' encoding='UTF-8'?>
+# generate an auth token
+authToken=$( /usr/bin/curl "$jamfProURL/api/auth/tokens" \
+                --silent \
+                --request POST \
+                --header "Authorization: Basic $encodedCredentials" )
+
+# parse authToken for token, omit expiration
+token=$( /usr/bin/awk -F \" '{ print $4 }' <<< "$authToken" | /usr/bin/xargs )
+
+targetCategoryID="19" #Jamf
+targetCategoryName="Z_Archives" #Jamf
+echo
+payload="<?xml version='1.0' encoding='UTF-8'?>
 <policy>
         <general>
                 <category>
-                        <id>${TARGET_CATEGORY_ID}</id>
-                        <name>${TARGET_CATEGORY_NAME}</name>
+                        <id>${targetCategoryID}</id>
+                        <name>${targetCategoryName}</name>
                 </category>
 	</general>
 </policy>"
 
-echo $PAYLOAD
+# echo $payload
 
 echo "Getting policies"
 
-POLICIES=$(curl --location -H "Accept: text/xml" -sfkN -H "Authorization: Basic ${DECRYPT_STRING}" "${URL_JAMF}/JSSResource/policies")
+policies=$(curl "${jamfProURL}/JSSResource/policies" \
+                --location \
+                --header "Accept: text/xml" \
+                --header "Authorization: Bearer ${token}" \
+                -sfkN )
 
-POLICIES_COUNT=$(echo $POLICIES | xmllint --xpath '//policies/size/text()' -)
+policiesCount=$(echo $policies | xmllint --xpath '//policies/size/text()' -)
 
-echo "Found $POLICIES_COUNT policies"
+echo "Found $policiesCount policies"
 count=0
-for ((i=1; i<=POLICIES_COUNT; i++)); do
-        POLICY_ID=$(echo $POLICIES | xmllint --xpath "string(//policies/policy[$i]/id/text())" -)
-        POLICY_NAME=$(echo $POLICIES | xmllint --xpath "string(//policies/policy[$i]/name/text())" -)
-        echo "Checking ${POLICY_ID} > ${POLICY_NAME}"
-        POLICY=$(curl --location \
-                -H "Accept: text/xml" \
-                -sfkN \
-                -H "Authorization: Basic ${DECRYPT_STRING}" \
-                "${URL_JAMF}/JSSResource/policies/id/${POLICY_ID}")
-        IS_ENABLED=$(echo $POLICY | xmllint --xpath "string(//policy/general/enabled/text())" -)
-        echo "Policy is enabled : $IS_ENABLED"
+for ((i=1; i<=policiesCount; i++)); do
+        policyID=$(echo $policies | xmllint --xpath "string(//policies/policy[$i]/id/text())" -)
+        policyName=$(echo $policies | xmllint --xpath "string(//policies/policy[$i]/name/text())" -)
+        echo "Checking ${policyID} > ${policyName}"
+        policy=$(curl "${jamfProURL}/JSSResource/policies/id/${policyID}" \
+                --location \
+                --header "Accept: text/xml" \
+                --header "Authorization: Bearer ${token}" \
+                -sfkN )
+        isEnabled=$(echo $policy | xmllint --xpath "string(//policy/general/enabled/text())" -)
+        echo "Policy is enabled : $isEnabled"
         
-        if [[ $IS_ENABLED == "false" ]]; then
-                echo "Moving policy to ${TARGET_CATEGORY_NAME}"
-                RESULT=$(curl --location \
-                        --request PUT "${URL_JAMF}/JSSResource/policies/id/${POLICY_ID}" \
+        if [[ $isEnabled == "false" ]]; then
+                echo "Moving policy to ${targetCategoryName}"
+                moveResult=$(curl "${jamfProURL}/JSSResource/policies/id/${policyID}" \
+                        --location \
+                        --request PUT  \
                         --header 'Accept: application/xml' \
                         --header 'Content-Type: text/plain' \
-                        --header "Authorization: Basic ${DECRYPT_STRING}" \
-                        --data-raw "${PAYLOAD}" \
+                        --header "Authorization: Bearer ${token}" \
+                        --data-raw "${payload}" \
                         -w "\n%{http_code}" -skfN)
 
-                HTTP_CODE=$(tail -n1 <<< "${RESULT}")
-                HTTP_BODY=$(sed '$ d' <<< "${RESULT}") 
+                HTTP_CODE=$(tail -n1 <<< "${moveResult}")
+                HTTP_BODY=$(sed '$ d' <<< "${moveResult}") 
 
                 echo "Command HTTP result : ${HTTP_CODE}"
                 echo "Response : ${HTTP_BODY}"
                 ((count++))
         fi
 done 
-echo "Moved $count policies to $TARGET_CATEGORY_NAME"
+echo "Moved $count policies to $targetCategoryName"
+
+#invalidate the Token
+authToken=$(/usr/bin/curl "${jamfProURL}/api/v1/auth/invalidate-token" \
+                --silent \
+                --header "Authorization: Bearer ${token}" \
+                --request POST)
+token=""
